@@ -290,7 +290,6 @@ class Qwen2VLGRPOTrainer(Trainer):
             pad_token_id=pad_token_id,
         )
         self.beta = args.beta
-        self.epsilon = args.epsilon
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
@@ -361,7 +360,6 @@ class Qwen2VLGRPOTrainer(Trainer):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
     
-        device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
         # Handle both pre-loaded images and image paths
@@ -416,6 +414,7 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
+        device = self.accelerator.device
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
@@ -486,17 +485,9 @@ class Qwen2VLGRPOTrainer(Trainer):
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
-        # Apply epsilon clipping
-        coef_1 = torch.exp(per_token_logps - per_token_logps.detach())
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-
-        # Add KL penalty if beta > 0
-        if self.beta > 0:
-            per_token_loss = per_token_loss + self.beta * per_token_kl
-
+        # x - x.detach() allows for preserving gradients from x
+        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+        per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
         # Log the metrics
@@ -517,11 +508,6 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
-
-        # Log clip ratio
-        is_clipped = (per_token_loss1 < per_token_loss2).float()
-        clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
-        self._metrics["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
 
         return loss
 
