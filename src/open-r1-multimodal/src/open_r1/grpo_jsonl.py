@@ -115,7 +115,12 @@ class GRPOScriptArguments(ScriptArguments):
             "choices": ["default", "modified", "modified_bf16", "modified_optimized_bf16"]
         },
     )
-
+    reward_method: Optional[str] = field(
+        default="default",
+        metadata={
+            "help": "Choose reward method: 'default', 'ratio', 'choice', ..."
+        },
+    )
 
 def extract_choice(text):
     # 1. Clean and normalize text
@@ -163,61 +168,93 @@ def extract_choice(text):
     # Return highest scoring choice
     return max(choice_scores.items(), key=lambda x: x[1])[0]
 
+
+def mcq_reward(content, sol, **kwargs):
+    # For multiple choice, extract and compare choices
+    has_choices = re.search(r'Answer:\s*([A-Z])', sol, re.IGNORECASE)
+    correct_choice = has_choices.group(1).upper() if has_choices else sol.strip()
+
+    # Extract answer from content if it has think/answer tags
+    content_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
+    student_answer = content_match.group(1).strip() if content_match else content.strip()
+    student_choice = extract_choice(student_answer)
+    if student_choice:
+        reward = 1.0 if student_choice == correct_choice else 0.0
+    else:
+        reward = 0.0
+
+    return reward
+
+
+def default_accuracy_reward(content, sol, **kwargs):
+    reward = 0.0
+    # Try symbolic verification first for numeric answers
+    try:
+        answer = parse(content)
+        if float(verify(answer, parse(sol))) > 0:
+            reward = 1.0
+    except Exception:
+        pass  # Continue to next verification method if this fails
+
+    # If symbolic verification failed, try string matching or fuzzy matching
+    if reward == 0.0:
+        try:
+            # Extract answer from solution if it has think/answer tags
+            sol_match = re.search(r'<answer>(.*?)</answer>', sol)
+            ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
+            
+            # Extract answer from content if it has think/answer tags
+            content_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
+            student_answer = content_match.group(1).strip() if content_match else content.strip()
+            
+            # Check if ground truth contains numbers
+            has_numbers = bool(re.search(r'\d', ground_truth))
+            # Check if it's a multiple choice question
+            has_choices = re.search(r'Answer:\s*([A-D])', sol, re.IGNORECASE)
+            
+            if has_numbers:
+                # For numeric answers, use exact matching
+                reward = 1.0 if student_answer == ground_truth else 0.0
+            elif has_choices:
+                # For multiple choice, extract and compare choices
+                correct_choice = has_choices.group(1).upper()
+                student_choice = extract_choice(student_answer)
+                if student_choice:
+                    reward = 1.0 if student_choice == correct_choice else 0.0
+            else:
+                # For text answers, use fuzzy matching
+                reward = ratio(student_answer.lower(), ground_truth.rstrip(".").lower())
+        except Exception:
+            pass  # Keep reward as 0.0 if all methods fail
+
+    return reward
+
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is correct using symbolic verification, exact string matching, or fuzzy matching."""
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
-    current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
-    
-    for content, sol in zip(contents, solution):
-        reward = 0.0
-        # Try symbolic verification first for numeric answers
-        try:
-            answer = parse(content)
-            if float(verify(answer, parse(sol))) > 0:
-                reward = 1.0
-        except Exception:
-            pass  # Continue to next verification method if this fails
-
-        # If symbolic verification failed, try string matching or fuzzy matching
-        if reward == 0.0:
-            try:
-                # Extract answer from solution if it has think/answer tags
-                sol_match = re.search(r'<answer>(.*?)</answer>', sol)
-                ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
-                
-                # Extract answer from content if it has think/answer tags
-                content_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
-                student_answer = content_match.group(1).strip() if content_match else content.strip()
-                
-                # Check if ground truth contains numbers
-                has_numbers = bool(re.search(r'\d', ground_truth))
-                # Check if it's a multiple choice question
-                has_choices = re.search(r'Answer:\s*([A-D])', sol, re.IGNORECASE)
-                
-                if has_numbers:
-                    # For numeric answers, use exact matching
-                    reward = 1.0 if student_answer == ground_truth else 0.0
-                elif has_choices:
-                    # For multiple choice, extract and compare choices
-                    correct_choice = has_choices.group(1).upper()
-                    student_choice = extract_choice(student_answer)
-                    if student_choice:
-                        reward = 1.0 if student_choice == correct_choice else 0.0
-                else:
-                    # For text answers, use fuzzy matching
-                    reward = ratio(student_answer.lower(), ground_truth.lower())
-                    
-            except Exception:
-                pass  # Keep reward as 0.0 if all methods fail
-
+    for content, sol, accu_reward_method in zip(contents, solution, kwargs.get("accu_reward_method")):
+        # if accu_reward_method is defined, use the corresponding reward function, otherwise use the default reward function
+        if accu_reward_method == "mcq":
+            reward = mcq_reward(content, sol)
+        else:
+            reward = default_accuracy_reward(content, sol)  
         rewards.append(reward)
-        if os.getenv("DEBUG_MODE") == "true":
-            log_path = os.getenv("LOG_PATH")
-            with open(log_path, "a", encoding='utf-8') as f:
-                f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
-                f.write(f"Content: {content}\n")
-                f.write(f"Solution: {sol}\n")
+        
+    if os.getenv("DEBUG_MODE") == "true":
+        log_path = os.getenv("LOG_PATH")
+        current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+        image_path = kwargs.get("image_path")[0]
+        problem = kwargs.get("problem")[0]
+        with open(log_path, "a", encoding='utf-8') as f:
+            f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
+            f.write(f"accu_reward_method: {accu_reward_method}\n")
+            f.write(f"image_path: {image_path}\n")
+            f.write(f"problem: {problem}\n")
+            f.write(f"Content: {content}\n")
+            f.write(f"Solution: {sol}\n")     
+
+        
     return rewards
 
 
@@ -263,12 +300,13 @@ def main(script_args, training_args, model_args):
     
     data_files = script_args.data_file_paths.split(":")
     image_folders = script_args.image_folders.split(":")
+    accu_reward_methods = script_args.reward_method.split(":")
     
     if len(data_files) != len(image_folders):
         raise ValueError("Number of data files must match number of image folders")
     
     all_data = []
-    for data_file, image_folder in zip(data_files, image_folders):
+    for data_file, image_folder, accu_reward_method in zip(data_files, image_folders, accu_reward_methods):
         with open(data_file, 'r') as f:
             for line in f:
                 item = json.loads(line)
@@ -278,6 +316,7 @@ def main(script_args, training_args, model_args):
                 item['problem'] = item['conversations'][0]['value'].replace('<image>', '')
                 item['solution'] = item['conversations'][1]['value'].replace('<answer>', '').replace('</answer>', '').strip()
                 del item['image'] # remove the image column so that it can be loaded later
+                item['accu_reward_method'] = item.get('accu_reward_method', accu_reward_method) # if accu_reward_method is in the data jsonl, use the value in the data jsonl, otherwise use the defined value
                 all_data.append(item)
     
     dataset = Dataset.from_list(all_data)
@@ -288,11 +327,12 @@ def main(script_args, training_args, model_args):
             'image_path': example['image_path'],  # Store path instead of loaded image
             'problem': example['problem'],
             'solution': f"<answer> {example['solution']} </answer>",
+            'accu_reward_method': example['accu_reward_method'],
             'prompt': [{
                 'role': 'user',
                 'content': [
                     {'type': 'image', 'text': None},
-                    {'type': 'text', 'text': example['problem'] + '  Output the thinking process in <think> </think> and final answer (number) in <answer> </answer> tags.'}
+                    {'type': 'text', 'text': example['problem'] + '  Output the thinking process in <think> </think> and final answer in <answer> </answer> tags.'}
                 ]
             }]
         }
@@ -308,6 +348,8 @@ def main(script_args, training_args, model_args):
         )
         splits['train'] = train_val_split['train']
         splits['validation'] = train_val_split['test']
+
+    # Select trainer class based on vlm_trainer argument
 
     trainer_cls = Qwen2VLGRPOTrainer
     print("using trainer:", trainer_cls.__name__)

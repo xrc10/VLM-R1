@@ -82,6 +82,8 @@ torchrun --nproc_per_node="8" \
 ![image](./assets/iou.jpg)
 <!-- ![image](./assets/wandb.jpg) -->
 
+#### Multi-Node GRPO
+For multi-node training, please refers to [multinode_training_demo.sh](src/open-r1-multimodal/multinode_training_demo.sh).
 
 #### SFT
 We use [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) to train the SFT model.
