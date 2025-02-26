@@ -429,12 +429,12 @@ class Qwen2VLGRPOTrainer(Trainer):
         pixel_values = prompt_inputs["pixel_values"].repeat(self.num_generations, 1)
         image_grid_thw = prompt_inputs["image_grid_thw"].repeat_interleave(self.num_generations, dim=0)
 
-        with torch.inference_mode():
+        with torch.no_grad():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its
             # computation here, and use per_token_logps.detach() instead.
             if self.num_iterations > 1:
                 old_per_token_logps = self._get_per_token_logps(
-                    self.model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw
+                    model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw
                 )
                 old_per_token_logps = old_per_token_logps[:, prompt_length - 1:]
             else:
@@ -447,9 +447,9 @@ class Qwen2VLGRPOTrainer(Trainer):
                     self.ref_model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw
                 )
             else:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                with self.accelerator.unwrap_model(model).disable_adapter():
                     ref_per_token_logps = self._get_per_token_logps(
-                        self.model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw
+                        model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw
                     )
         ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1:]
 
@@ -533,7 +533,7 @@ class Qwen2VLGRPOTrainer(Trainer):
     
         # Check if we need to generate new completions or use buffered ones
         if self.state.global_step % self.num_iterations == 0:
-            inputs = self._generate_and_score_completions(inputs)
+            inputs = self._generate_and_score_completions(inputs, model)
             self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
         else:
             inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
