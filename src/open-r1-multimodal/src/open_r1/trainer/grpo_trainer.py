@@ -359,16 +359,11 @@ class Qwen2VLGRPOTrainer(Trainer):
         return torch.stack(per_token_logps)
 
 
-    def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
-        if self.state.global_step % self.num_iterations == 0:
-            inputs = self._generate_and_score_completions(inputs)
-            self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
-        else:
-            inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
-        self._step += 1
+    def _prepare_inputs(self, inputs):
+        # Simple pass-through, just like original
         return inputs
 
-    def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+    def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]], model) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
@@ -414,7 +409,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
         # Generate completions
-        with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
             prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.generation_config)
 
             prompt_length = prompt_ids.size(1)
@@ -536,6 +531,14 @@ class Qwen2VLGRPOTrainer(Trainer):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
     
+        # Check if we need to generate new completions or use buffered ones
+        if self.state.global_step % self.num_iterations == 0:
+            inputs = self._generate_and_score_completions(inputs)
+            self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
+        else:
+            inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
+        self._step += 1
+
         # Get the prepared inputs
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]

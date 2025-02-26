@@ -48,6 +48,7 @@ from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 import PIL.Image
 
 import copy
+import time  # Add this import at the top with other imports
 
 
 if is_peft_available():
@@ -310,6 +311,11 @@ class Qwen2VLGRPOTrainer(Trainer):
         # Initialize the metrics
         self._metrics = defaultdict(list)
 
+        # Add timing metrics
+        self.prepare_inputs_time = 0
+        self.compute_loss_time = 0
+        self.num_steps = 0
+
         super().__init__(
             model=model,
             args=args,
@@ -360,12 +366,19 @@ class Qwen2VLGRPOTrainer(Trainer):
 
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+        start_time = time.perf_counter()
+        
         if self.state.global_step % self.num_iterations == 0:
             inputs = self._generate_and_score_completions(inputs)
             self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
         else:
             inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
         self._step += 1
+
+        end_time = time.perf_counter()
+        self.prepare_inputs_time += end_time - start_time
+        self.num_steps += 1
+        
         return inputs
 
     def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
@@ -533,6 +546,8 @@ class Qwen2VLGRPOTrainer(Trainer):
         }
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        start_time = time.perf_counter()
+        
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
     
@@ -583,10 +598,19 @@ class Qwen2VLGRPOTrainer(Trainer):
         clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
         self._metrics["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
 
+        end_time = time.perf_counter()
+        self.compute_loss_time += end_time - start_time
+        
         return loss
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}
+        
+        # Add timing metrics
+        if self.num_steps > 0:
+            metrics["prepare_inputs_avg_time"] = self.prepare_inputs_time / self.num_steps
+            metrics["compute_loss_avg_time"] = self.compute_loss_time / self.num_steps
+        
         logs = {**logs, **metrics}
         if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
             super().log(logs, start_time)
