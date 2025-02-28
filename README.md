@@ -11,7 +11,8 @@ Since the introduction of [Deepseek-R1](https://github.com/deepseek-ai/DeepSeek-
 Specifically, for the task of Referring Expression Comprehension (REC), we trained [Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL) using both R1 and SFT approaches. The results reveal that, on the in-domain test data, the performance of the SFT model is slightly lower than that of the R1 model (as shown at the top of the figure above). However, on the out-of-domain test data, the SFT model’s performance deteriorates significantly as the number of steps increases, while the R1 model shows a steady improvement (as shown at the bottom of the figure above).
 
 ## Update
-
+- 2025-02-27: We support the `number of iterations per batch` and `epsilon value for clipping` in the original GRPO algorithm with args: `--num_iterations` and `--epsilon`.
+- 2025-02-25: We support multi-node training for GRPO. See [multinode_training_demo.sh](src/open-r1-multimodal/multinode_training_demo.sh) for details.
 - 2025-02-21: We release the [checkpoint](https://huggingface.co/omlab/Qwen2.5VL-3B-VLM-R1-REC-500steps) of the VLM-R1 REC model.
 - 2025-02-20: We release the script for [general data loading](#for-your-own-data).
 - 2025-02-19: We incorporate an explanation of the [SFT](#sft) method.

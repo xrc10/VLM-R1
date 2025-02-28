@@ -18,6 +18,7 @@ import pathlib
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
+from babel.numbers import parse_decimal
 
 from datasets import load_dataset, load_from_disk
 from transformers import Qwen2VLForConditionalGeneration
@@ -116,9 +117,9 @@ class GRPOScriptArguments(ScriptArguments):
         },
     )
     reward_method: Optional[str] = field(
-        default="default",
+        default=None,
         metadata={
-            "help": "Choose reward method: 'default', 'ratio', 'choice', ..."
+            "help": "Choose reward method: 'default', 'mcp', ..."
         },
     )
 
@@ -128,7 +129,7 @@ def extract_choice(text):
     text = re.sub(r'\s+', ' ', text)  # Normalize spaces
 
     # 2. Choice should not have uppercase letters before or after
-    choices = re.findall(r'(?<![A-Z])([A-D])(?![A-Z])', text)
+    choices = re.findall(r'(?<![A-Z])([A-Z])(?![A-Z])', text)
 
     if not choices:
         return None
@@ -171,8 +172,8 @@ def extract_choice(text):
 
 def mcq_reward(content, sol, **kwargs):
     # For multiple choice, extract and compare choices
-    has_choices = re.search(r'Answer:\s*([A-Z])', sol, re.IGNORECASE)
-    correct_choice = has_choices.group(1).upper() if has_choices else sol.strip()
+    has_choices = extract_choice(sol)
+    correct_choice = has_choices.upper() if has_choices else sol.strip()
 
     # Extract answer from content if it has think/answer tags
     content_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
@@ -185,6 +186,54 @@ def mcq_reward(content, sol, **kwargs):
 
     return reward
 
+
+def yes_no_reward(content, sol, **kwargs):
+    content = content.lower()
+    sol = sol.lower()
+
+    # Extract answer from solution if it has think/answer tags
+    sol_match = re.search(r'<answer>(.*?)</answer>', sol)
+    ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
+
+    # Extract answer from content if it has think/answer tags
+    content_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
+    student_answer = content_match.group(1).strip() if content_match else content.strip()
+
+    ground_yes_no = re.search(r'(yes|no)', ground_truth)
+    ground_yes_no = ground_yes_no.group(1) if ground_yes_no else ''
+    student_yes_no = re.search(r'(yes|no)', student_answer)
+    student_yes_no = student_yes_no.group(1) if student_yes_no else ''
+
+    reward = 1.0 if ground_yes_no == student_yes_no else 0.0
+
+    return reward
+
+def numeric_reward(content, sol, **kwargs):
+    content = clean_text(content)
+    sol = clean_text(sol)
+    try:
+        content, sol = float(content), float(sol)
+        return 1.0 if content == sol else 0.0
+    except:
+        return None
+
+def clean_text(text, exclue_chars=['\n', '\r']):
+    # Extract content between <answer> and </answer> if present
+    answer_match = re.search(r'<answer>(.*?)</answer>', text, re.DOTALL)
+    if answer_match:
+        text = answer_match.group(1)
+    
+    for char in exclue_chars:
+        if char in ['\n', '\r']:
+            # If there is a space before the newline, remove the newline
+            text = re.sub(r'(?<=\s)' + re.escape(char), '', text)
+            # If there is no space before the newline, replace it with a space
+            text = re.sub(r'(?<!\s)' + re.escape(char), ' ', text)
+        else:
+            text = text.replace(char, ' ')
+    
+    # Remove leading and trailing spaces and convert to lowercase
+    return text.strip().rstrip('.').lower()
 
 def default_accuracy_reward(content, sol, **kwargs):
     reward = 0.0
@@ -210,20 +259,22 @@ def default_accuracy_reward(content, sol, **kwargs):
             # Check if ground truth contains numbers
             has_numbers = bool(re.search(r'\d', ground_truth))
             # Check if it's a multiple choice question
-            has_choices = re.search(r'Answer:\s*([A-D])', sol, re.IGNORECASE)
+            has_choices = extract_choice(ground_truth)
             
             if has_numbers:
                 # For numeric answers, use exact matching
-                reward = 1.0 if student_answer == ground_truth else 0.0
+                reward = numeric_reward(student_answer, ground_truth)
+                if reward is None:
+                    reward = ratio(clean_text(student_answer), clean_text(ground_truth))
             elif has_choices:
                 # For multiple choice, extract and compare choices
-                correct_choice = has_choices.group(1).upper()
+                correct_choice = has_choices.upper()
                 student_choice = extract_choice(student_answer)
                 if student_choice:
                     reward = 1.0 if student_choice == correct_choice else 0.0
             else:
                 # For text answers, use fuzzy matching
-                reward = ratio(student_answer.lower(), ground_truth.rstrip(".").lower())
+                reward = ratio(clean_text(student_answer), clean_text(ground_truth))
         except Exception:
             pass  # Keep reward as 0.0 if all methods fail
 
@@ -237,6 +288,8 @@ def accuracy_reward(completions, solution, **kwargs):
         # if accu_reward_method is defined, use the corresponding reward function, otherwise use the default reward function
         if accu_reward_method == "mcq":
             reward = mcq_reward(content, sol)
+        elif accu_reward_method == 'yes_no':
+            reward = yes_no_reward(content, sol)
         else:
             reward = default_accuracy_reward(content, sol)  
         rewards.append(reward)
@@ -296,11 +349,20 @@ def main(script_args, training_args, model_args):
 
     # Load the JSONL datasets
     import json
-    from datasets import Dataset
+    from datasets import Dataset, Features, Value
     
     data_files = script_args.data_file_paths.split(":")
     image_folders = script_args.image_folders.split(":")
-    accu_reward_methods = script_args.reward_method.split(":")
+    
+    if len(data_files) != len(image_folders):
+        raise ValueError("Number of data files must match number of image folders")
+    
+    if script_args.reward_method is None:
+        accu_reward_methods = ["default"] * len(data_files)
+    else:
+        accu_reward_methods = script_args.reward_method.split(":")
+        assert len(accu_reward_methods) == len(data_files), f"Number of reward methods must match number of data files: {len(accu_reward_methods)} != {len(data_files)}"
+
     
     if len(data_files) != len(image_folders):
         raise ValueError("Number of data files must match number of image folders")
@@ -314,8 +376,17 @@ def main(script_args, training_args, model_args):
                 item['image_path'] = os.path.join(image_folder, item['image'])
                 # Remove immediate image loading
                 item['problem'] = item['conversations'][0]['value'].replace('<image>', '')
-                item['solution'] = item['conversations'][1]['value'].replace('<answer>', '').replace('</answer>', '').strip()
+                
+                # Handle solution that could be a float or string
+                solution_value = item['conversations'][1]['value']
+                if isinstance(solution_value, str):
+                    item['solution'] = solution_value.replace('<answer>', '').replace('</answer>', '').strip()
+                else:
+                    # If it's a float or other non-string type, keep it as is
+                    item['solution'] = str(solution_value)
+                
                 del item['image'] # remove the image column so that it can be loaded later
+                del item['conversations']
                 item['accu_reward_method'] = item.get('accu_reward_method', accu_reward_method) # if accu_reward_method is in the data jsonl, use the value in the data jsonl, otherwise use the defined value
                 all_data.append(item)
     
@@ -350,7 +421,6 @@ def main(script_args, training_args, model_args):
         splits['validation'] = train_val_split['test']
 
     # Select trainer class based on vlm_trainer argument
-
     trainer_cls = Qwen2VLGRPOTrainer
     print("using trainer:", trainer_cls.__name__)
 

@@ -38,7 +38,7 @@ def extract_bbox_answer(content):
     # Try to find the bbox within <answer> tags, if can not find, return [0, 0, 0, 0]
     answer_tag_pattern = r'<answer>(.*?)</answer>'
     bbox_pattern = r'\{.*\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)]\s*.*\}'
-    content_answer_match = re.search(answer_tag_pattern, content)
+    content_answer_match = re.search(answer_tag_pattern, content, re.DOTALL)
     if content_answer_match:
         content_answer = content_answer_match.group(1).strip()
         bbox_match = re.search(bbox_pattern, content_answer)
