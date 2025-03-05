@@ -495,6 +495,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                         # This is particularly useful here because we generate completions from the same prompts.
                         enable_prefix_caching=self.args.vllm_enable_prefix_caching,
                         max_model_len=self.args.vllm_max_model_len,
+                        enforce_eager=True,
                         mm_processor_kwargs={
                             "max_pixels": max_pixels,
                             "min_pixels": min_pixels,
