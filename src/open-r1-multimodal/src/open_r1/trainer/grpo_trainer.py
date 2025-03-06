@@ -499,6 +499,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                         mm_processor_kwargs={
                             "max_pixels": max_pixels,
                             "min_pixels": min_pixels,
+                            "do_rescale": False,  # Prevent double rescaling of images
                         },
                     )
                     print("vLLM initialized")
