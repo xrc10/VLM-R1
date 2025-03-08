@@ -25,6 +25,8 @@ Specifically, for the task of Referring Expression Comprehension (REC), we train
 - [x] Implement LoRA Fine-tuning.
 - [ ] Support more Multimodal LLMs.
 - [ ] Release the VLM-R1 Math model.
+- [ ] Study cross task generalization.
+- [ ] Enhance VLM for other tasks [welcome issue]. 
 
 ## Setup
 
