@@ -86,7 +86,8 @@ torchrun --nproc_per_node="8" \
     --num_train_epochs 2 \
     --run_name $RUN_NAME \
     --save_steps 100 \
-    --save_only_model true
+    --save_only_model true \
+    --freeze_vision_modules false # If you want to only finetune the language model, set this to true.
 ```
 
 ![image](./assets/iou.jpg)
