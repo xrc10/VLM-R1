@@ -20,6 +20,12 @@ Specifically, for the task of Referring Expression Comprehension (REC), we train
 - 2025-02-17: We release the VLM-R1 REC [Demo](https://huggingface.co/spaces/omlab/VLM-R1-Referral-Expression) on Hugging Face Spaces.
 - 2025-02-15: We release the VLM-R1 repository and [GRPO](#grpo) training script.
 
+## ToDo
+- [x] Implement multi-node training.
+- [x] Implement LoRA Fine-tuning.
+- [ ] Support more Multimodal LLMs.
+- [ ] Release the VLM-R1 Math model.
+
 ## Setup
 
 ```bash
