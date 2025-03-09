@@ -156,6 +156,9 @@ for ds in TEST_DATASETS:
 
     # Save results to a JSON file
     output_path = OUTPUT_PATH.format(DATASET=ds, STEPS=steps)
+    output_dir = os.path.dirname(output_path)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     with open(output_path, "w") as f:
         json.dump({
             'accuracy': accuracy,
