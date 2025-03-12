@@ -271,10 +271,12 @@ def iou_reward(completions, solution, **kwargs):
                 
         rewards.append(reward)
         if os.getenv("DEBUG_MODE") == "true":
+            problem = kwargs.get("problem")[0]
             log_path = os.getenv("LOG_PATH")
             # local_rank = int(os.getenv("LOCAL_RANK", 0))
             with open(log_path, "a", encoding='utf-8') as f:
                 f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
+                f.write(f"problem: {problem}\n")
                 f.write(f"Content: {content}\n")
                 f.write(f"Solution: {sol}\n")
     return rewards

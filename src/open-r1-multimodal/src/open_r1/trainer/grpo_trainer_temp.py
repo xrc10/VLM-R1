@@ -500,7 +500,8 @@ class Qwen2VLGRPOTrainer(Trainer):
                         enable_chunked_prefill=False,
                         mm_processor_kwargs={
                             "max_pixels": max_pixels,
-                            "min_pixels": min_pixels
+                            "min_pixels": min_pixels,
+                            "do_rescale": False
                         },
                     )
                     print("vLLM initialized")
@@ -690,7 +691,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                 # Prepare multimodal inputs for vLLM
                 all_multimodal_inputs = [
                     {"prompt": prompt, "multi_modal_data": {"image": image},
-                    "mm_processor_kwargs": { "max_pixels": self.max_pixels, "min_pixels": self.min_pixels} } 
+                    "mm_processor_kwargs": { "max_pixels": self.max_pixels, "min_pixels": self.min_pixels, "do_rescale": False} } 
                     for prompt, image in zip(all_prompts_text, all_images)
                 ]
                 
@@ -704,8 +705,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                         seen[key] = True
                         ordered_unique_inputs.append(input_dict)
                         
-                # print("ordered_unique_inputs: ", ordered_unique_inputs)
-                print("len(ordered_unique_inputs): ", len(ordered_unique_inputs))
+                print("ordered_unique_inputs: ", ordered_unique_inputs)
                 all_outputs = self.llm.generate(
                     ordered_unique_inputs, sampling_params=self.sampling_params, use_tqdm=False,
                 )
@@ -719,10 +719,6 @@ class Qwen2VLGRPOTrainer(Trainer):
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
-            
-            # Add explicit synchronization point to prevent hanging
-            self.accelerator.wait_for_everyone()
-
             process_slice = slice(
                 self.accelerator.process_index * len(prompts),
                 (self.accelerator.process_index + 1) * len(prompts),
@@ -865,9 +861,6 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
 
-        # At the end of _generate_and_score_completions
-        self.accelerator.wait_for_everyone()
-        
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
