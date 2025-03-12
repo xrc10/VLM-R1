@@ -16,6 +16,7 @@ import os
 import textwrap
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union, Sized
+from contextlib import nullcontext
 
 import torch
 import torch.utils.data
@@ -55,6 +56,8 @@ import warnings
 from unittest.mock import patch
 # Add vLLM import
 from trl.import_utils import is_vllm_available
+from accelerate.utils.other import is_compiled_module
+import time  # Add this import at the top with other imports
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -524,9 +527,9 @@ class Qwen2VLGRPOTrainer(Trainer):
             # When using vLLM, the main process is responsible for loading the model weights. This can cause process
             # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
             # synchronize all processes after vLLM has been fully initialized.
-            print("Waiting for everyone")
+            # print("Waiting for everyone")
             self.accelerator.wait_for_everyone()
-            print("Everyone is here")
+            # print("Everyone is here")
         else:
             self.generation_config = GenerationConfig(
                 max_new_tokens=self.max_completion_length,
@@ -583,9 +586,18 @@ class Qwen2VLGRPOTrainer(Trainer):
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids, attention_mask, pixel_values, image_grid_thw):
-        logits = model(input_ids, attention_mask=attention_mask, pixel_values=pixel_values, image_grid_thw=image_grid_thw).logits  # (B, L, V)
+        # Remove the inference_mode context manager - we need gradients for training
+        outputs = model(
+            input_ids, 
+            attention_mask=attention_mask, 
+            pixel_values=pixel_values, 
+            image_grid_thw=image_grid_thw
+        )
+        logits = outputs.logits  # (B, L, V)
+        
         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
         input_ids = input_ids[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+        
         # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
         per_token_logps = []
         for logits_row, input_ids_row in zip(logits, input_ids):
@@ -594,17 +606,23 @@ class Qwen2VLGRPOTrainer(Trainer):
             per_token_logps.append(token_log_prob)
         return torch.stack(per_token_logps)
 
-
-    def _prepare_inputs(self, inputs):
-        # Simple pass-through, just like original
-        return inputs
-
     def _move_model_to_vllm(self):
+        start_time = time.time()
         with unwrap_model_for_generation(
             self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
         ) as unwrapped_model:
+            if is_compiled_module(unwrapped_model):
+                unwrapped_model = unwrapped_model._orig_mod
             if is_peft_model(unwrapped_model):
+                unwrap_time = time.time()
+                print(f"Unwrapping model took {unwrap_time - start_time:.4f} seconds")
+                
+                merge_start = time.time()
                 unwrapped_model.merge_adapter()
+                merge_time = time.time()
+                print(f"Merging adapter took {merge_time - merge_start:.4f} seconds")
+                
+                state_dict_start = time.time()
                 state_dict = unwrapped_model.state_dict()
                 # Remove base_model and base_layer prefixes
                 state_dict = {
@@ -618,19 +636,42 @@ class Qwen2VLGRPOTrainer(Trainer):
                     for k, v in state_dict.items()
                     if "original_module" not in k
                 }
+                state_dict_time = time.time()
+                print(f"Creating state dict took {state_dict_time - state_dict_start:.4f} seconds")
             else:
+                state_dict_start = time.time()
                 state_dict = unwrapped_model.state_dict()
+                state_dict_time = time.time()
+                print(f"Creating state dict took {state_dict_time - state_dict_start:.4f} seconds")
+            
             if self.accelerator.is_main_process:
+                load_start = time.time()
                 llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 llm_model.load_weights(state_dict.items())
+                load_time = time.time()
+                print(f"Loading weights into vLLM took {load_time - load_start:.4f} seconds")
+                
             # Unmerge the adapter to restore the model to its original state.
             # This must be done after loading weights to ensure they correspond to the merged state.
             if is_peft_model(unwrapped_model):
+                unmerge_start = time.time()
                 unwrapped_model.unmerge_adapter()
+                unmerge_time = time.time()
+                print(f"Unmerging adapter took {unmerge_time - unmerge_start:.4f} seconds")
+            
+        total_time = time.time() - start_time
+        print(f"Total time for moving model to vLLM: {total_time:.4f} seconds")
+
+    def _prepare_inputs(self, inputs):
+        # Simple pass-through, just like original
+        return inputs
 
     def _generate_and_score_completions(self, model, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+        total_start_time = time.time()
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
+        
+        prep_start_time = time.time()
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
         
         # Handle both pre-loaded images and image paths
@@ -654,7 +695,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                 img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
             
             images.append(img)
-
+        
         prompt_inputs = self.processing_class(
             text=prompts_text,
             images=images,
@@ -664,6 +705,8 @@ class Qwen2VLGRPOTrainer(Trainer):
             add_special_tokens=False,
         )
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prep_end_time = time.time()
+        print(f"Prompt preparation took {prep_end_time - prep_start_time:.4f} seconds")
 
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
         pixel_values = prompt_inputs["pixel_values"]
@@ -676,52 +719,81 @@ class Qwen2VLGRPOTrainer(Trainer):
             prompt_inputs["attention_mask"] = prompt_mask
 
         # Generate completions using either vLLM or regular generation
+        gen_start_time = time.time()
         if self.use_vllm:
             # First, have main process load weights if needed
+            weight_load_start = time.time()
             if self.state.global_step != self._last_loaded_step:
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
+            weight_load_end = time.time()
+            print(f"Weight loading took {weight_load_end - weight_load_start:.4f} seconds")
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            gather_start = time.time()
             all_prompts_text = gather_object(prompts_text)
             all_images = gather_object(images)
+            gather_end = time.time()
+            print(f"Gathering prompts and images took {gather_end - gather_start:.4f} seconds")
 
             if self.accelerator.is_main_process:
                 # Prepare multimodal inputs for vLLM
+                prep_vllm_start = time.time()
                 all_multimodal_inputs = [
                     {"prompt": prompt, "multi_modal_data": {"image": image},
                     "mm_processor_kwargs": { "max_pixels": self.max_pixels, "min_pixels": self.min_pixels} } 
                     for prompt, image in zip(all_prompts_text, all_images)
                 ]
                 
-                # Create a dictionary using tuples of (prompt, image id) as keys to identify unique prompt-image pairs
-                # We use id() of image since PIL Images aren't hashable
+                # Debug information to understand the data structure
+                print(f"On device {self.accelerator.device}, Total inputs gathered: {len(all_multimodal_inputs)}")
+                
+                # Create a dictionary to track unique prompt-image pairs
                 seen = {}
                 ordered_unique_inputs = []
-                for input_dict in all_multimodal_inputs:
+                
+                # Process inputs in chunks of num_generations (since each original input is repeated num_generations times)
+                for i in range(0, len(all_multimodal_inputs), self.num_generations):
+                    # Take only the first item from each chunk (they're all duplicates)
+                    input_dict = all_multimodal_inputs[i]
                     key = (input_dict["prompt"], id(input_dict["multi_modal_data"]["image"]))
                     if key not in seen:
                         seen[key] = True
                         ordered_unique_inputs.append(input_dict)
-                        
-                # print("ordered_unique_inputs: ", ordered_unique_inputs)
+                
                 print("len(ordered_unique_inputs): ", len(ordered_unique_inputs))
+                prep_vllm_end = time.time()
+                print(f"Preparing vLLM inputs took {prep_vllm_end - prep_vllm_start:.4f} seconds")
+                    
+                vllm_gen_start = time.time()
                 all_outputs = self.llm.generate(
                     ordered_unique_inputs, sampling_params=self.sampling_params, use_tqdm=False,
                 )
+                vllm_gen_end = time.time()
+                print(f"vLLM generation took {vllm_gen_end - vllm_gen_start:.4f} seconds")
+                
+                process_outputs_start = time.time()
                 completion_ids = []
                 for outputs in all_outputs:
                     for output in outputs.outputs:
                         completion_ids.append(output.token_ids)
+                process_outputs_end = time.time()
+                print(f"Processing vLLM outputs took {process_outputs_end - process_outputs_start:.4f} seconds")
             else:
                 completion_ids = [None] * len(all_prompts_text)
 
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
+            broadcast_start = time.time()
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            broadcast_end = time.time()
+            print(f"Broadcasting completions took {broadcast_end - broadcast_start:.4f} seconds")
             
             # Add explicit synchronization point to prevent hanging
-            self.accelerator.wait_for_everyone()
+            # sync_start = time.time()
+            # self.accelerator.wait_for_everyone()
+            # sync_end = time.time()
+            # print(f"Synchronization took {sync_end - sync_start:.4f} seconds")
 
             process_slice = slice(
                 self.accelerator.process_index * len(prompts),
@@ -730,6 +802,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             completion_ids = completion_ids[process_slice]
 
             # Pad the completions, and concatenate them with the prompts
+            pad_start = time.time()
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             max_len = max(len(ids) for ids in completion_ids)
             padded_completion_ids = []
@@ -742,14 +815,21 @@ class Qwen2VLGRPOTrainer(Trainer):
                     padded_completion_ids.append(ids)
             completion_ids = torch.stack(padded_completion_ids)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            pad_end = time.time()
+            print(f"Padding and stacking completions took {pad_end - pad_start:.4f} seconds")
 
         else:
             # Generate completions using transformers
+            hf_gen_start = time.time()
             with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
                 prompt_completion_ids = unwrapped_model.generate(
                     **prompt_inputs,
                     generation_config=self.generation_config
                 )
+            hf_gen_end = time.time()
+            print(f"HuggingFace generation took {hf_gen_end - hf_gen_start:.4f} seconds")
+        gen_end_time = time.time()
+        print(f"Total generation took {gen_end_time - gen_start_time:.4f} seconds")
 
         prompt_length = prompt_ids.size(1)
         prompt_ids = prompt_completion_ids[:, :prompt_length]
@@ -866,7 +946,11 @@ class Qwen2VLGRPOTrainer(Trainer):
         self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
 
         # At the end of _generate_and_score_completions
-        self.accelerator.wait_for_everyone()
+        # self.accelerator.wait_for_everyone()
+        
+        # At the end of the method
+        total_end_time = time.time()
+        print(f"Total _generate_and_score_completions took {total_end_time - total_start_time:.4f} seconds")
         
         return {
             "prompt_ids": prompt_ids,
