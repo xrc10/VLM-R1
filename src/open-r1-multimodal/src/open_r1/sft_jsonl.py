@@ -67,6 +67,59 @@ from dataclasses import field
 from qwen_vl_utils import process_vision_info
 logger = logging.getLogger(__name__)
 from dataclasses import dataclass
+from typing import Optional
+
+
+# ----------------------- Fix the flash attention bug in the current version of transformers -----------------------
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLVisionFlashAttention2, apply_rotary_pos_emb_flashatt, flash_attn_varlen_func
+import torch
+from typing import Tuple
+# Import the standard logging module for basicConfig
+import logging as python_logging
+# Import the transformers logging separately
+from transformers.utils import logging as transformers_logging
+
+from open_r1.trainer import VLMSFTTrainer
+
+logger = transformers_logging.get_logger(__name__)
+
+def custom_forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        seq_length = hidden_states.shape[0]
+        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        # print(111, 222, 333, 444, 555, 666, 777, 888, 999)
+        if position_embeddings is None:
+            logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `rotary_pos_emb` (2D tensor of RoPE theta values), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.54 `rotary_pos_emb` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            cos = emb.cos().float()
+            sin = emb.sin().float()
+        else:
+            cos, sin = position_embeddings
+            # Add this
+            cos = cos.to(torch.float)
+            sin = sin.to(torch.float)
+        q, k = apply_rotary_pos_emb_flashatt(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
+        q = q.squeeze(0)
+        k = k.squeeze(0)
+
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
+            seq_length, -1
+        )
+        attn_output = self.proj(attn_output)
+        return attn_output
+
+Qwen2_5_VLVisionFlashAttention2.forward = custom_forward
 
 @dataclass
 class SFTScriptArguments(ScriptArguments):
@@ -173,10 +226,10 @@ def main(script_args, training_args, model_args):
     ###############
     # Setup logging
     ###############
-    logging.basicConfig(
+    python_logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=[python_logging.StreamHandler(sys.stdout)],
     )
     log_level = training_args.get_process_log_level()
     logger.setLevel(log_level)
@@ -227,6 +280,15 @@ def main(script_args, training_args, model_args):
             model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, use_fast=True
         )
         logger.info("Using AutoTokenizer for text-only model.")
+    
+    # Set padding_side to 'left' to avoid issues with Flash Attention in Qwen2.5-VL
+    if hasattr(processor, "tokenizer"):
+        processor.tokenizer.padding_side = "left"
+        logger.info("Set tokenizer padding_side to 'left'")
+    else:
+        processor.padding_side = "left"
+        logger.info("Set processor padding_side to 'left'")
+        
     if hasattr(processor, "pad_token") and processor.pad_token is None:
         processor.pad_token = processor.eos_token
     elif hasattr(processor.tokenizer, "pad_token") and processor.tokenizer.pad_token is None:

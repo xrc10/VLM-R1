@@ -167,6 +167,8 @@ def main():
                     # If it's a float or other non-string type, keep it as is
                     item['solution'] = str(solution_value)
                 
+
+                del item['conversations']
                 all_data.append(item)
 
     dataset = Dataset.from_list(all_data)
@@ -189,6 +191,21 @@ def main():
                 'image_path': example['image_path'],  # Store path instead of loaded image
                 'problem': example['problem'],
                 'solution': f"{example['solution']}",
+                'prompt': [
+                    {
+                        'role': 'user',
+                        'content': [
+                            {'type': 'image', 'text': None},
+                            {'type': 'text', 'text': example['problem']}
+                        ]
+                    },
+                    {
+                        'role': 'assistant',
+                        'content': [
+                            {'type': 'text', 'text': example['solution']}
+                        ]
+                    }
+                ],
                 'input_ids': None,  # Will be filled during training
                 'attention_mask': None,  # Will be filled during training
                 'labels': None,  # Will be filled during training
@@ -197,6 +214,20 @@ def main():
             return {
                 'problem': example['problem'],
                 'solution': f"{example['solution']}",
+                'prompt': [
+                    {
+                        'role': 'user',
+                        'content': [
+                            {'type': 'text', 'text': example['problem']}
+                        ]
+                    },
+                    {
+                        'role': 'assistant',
+                        'content': [
+                            {'type': 'text', 'text': example['solution']}
+                        ]
+                    }
+                ],
                 'input_ids': None,  # Will be filled during training
                 'attention_mask': None,  # Will be filled during training
                 'labels': None,  # Will be filled during training
@@ -249,6 +280,7 @@ def main():
         peft_config = get_peft_config(model_args.peft_config_path)
     
     # Initialize the Trainer
+    training_args.remove_unused_columns = False
     # We don't need to define a data_collator here as it's already defined in VLMSFTTrainer
     trainer = VLMSFTTrainer(
         model=model,

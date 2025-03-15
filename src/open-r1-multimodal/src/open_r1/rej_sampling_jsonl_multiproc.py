@@ -31,6 +31,9 @@ from openai import OpenAI
 from tqdm import tqdm
 import concurrent.futures
 import threading
+import multiprocessing
+from queue import Empty
+from concurrent.futures import ThreadPoolExecutor
 
 def get_line_count(file_path):
     with open(file_path, 'r') as f:
@@ -402,13 +405,63 @@ SYSTEM_PROMPT = (
     "<think> reasoning process here </think><answer> answer here </answer>"
 )
 
+def call_api_for_completion(args):
+    """Helper function to make API calls in parallel"""
+    try:
+        # Unpack arguments
+        api_key, base_url, prompt, base64_image, default_kwargs, num_of_generations = args
+        
+        # Create client within the process
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url
+        )
+        
+        response = client.chat.completions.create(
+            model=default_kwargs["model"],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=default_kwargs.get("max_tokens", 1024),
+            temperature=default_kwargs.get("temperature", 0.7),
+            top_p=default_kwargs.get("top_p", 1.0),
+            n=num_of_generations
+        )
+        return response.choices
+    except Exception as e:
+        print(f"Error in API call: {e}")
+        return None
+
+def encode_image(image_path):
+    """Convert image file to base64 string."""
+    try:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        print(f"Error encoding image {image_path}: {e}")
+        raise
+
 def rejection_sampling_vqa(
-    image_paths, 
-    questions, 
-    ground_truths, 
-    output_file_path, 
-    openai_api_key=None, 
-    openai_base_url=None, 
+    image_paths,
+    questions,
+    ground_truths,
+    output_file_path,
+    openai_api_key=None,
+    openai_base_url=None,
     generation_kwargs=None,
     reward_funcs=None,
     accu_reward_methods=None,
@@ -416,6 +469,7 @@ def rejection_sampling_vqa(
     original_image_paths=None,
     line_numbers=None,
     num_of_generations=1,
+    num_api_threads=4
 ):
     """
     Perform rejection sampling for VQA data generation using OpenAI's vision models.
@@ -433,6 +487,7 @@ def rejection_sampling_vqa(
         original_image_paths (list, optional): List of original image paths from input JSONL
         line_numbers (list, optional): List of line numbers from the input file
         num_of_generations (int, optional): Number of generations to try for each example
+        num_api_threads (int, optional): Number of processes to use for parallel API calls
     
     Returns:
         int: Number of examples that passed rejection sampling
@@ -486,79 +541,55 @@ def rejection_sampling_vqa(
         log_f.write(f"Temperature: {default_kwargs['temperature']}\n")
         log_f.write(f"Max Tokens: {default_kwargs['max_tokens']}\n")
         log_f.write(f"Reward Threshold: {reward_threshold}\n")
-        log_f.write(f"Number of Generations: {num_of_generations}\n\n")
+        log_f.write(f"Number of Generations: {num_of_generations}\n")
+        log_f.write(f"Number of API Threads: {num_api_threads}\n\n")
     
-    # Create or open the output file
+    # Create a process pool for API calls
+    pool = multiprocessing.Pool(num_api_threads)
+    
+    # Process each example
     with open(output_file_path, 'a', encoding='utf-8') as f:
-        # Process each example
-        for idx, (image_path, question, ground_truth, line_number) in enumerate(zip(image_paths, questions, ground_truths, line_numbers)):
-            try:
-                # Log progress
-                with open(log_file, 'a') as log_f:
-                    log_f.write(f"\n--- Processing example {idx+1}/{len(questions)}, Line {line_number} ---\n")
-                    log_f.write(f"Question: {question}\n")
-                    log_f.write(f"Ground Truth: {ground_truth}\n")
-                    log_f.write(f"Image Path: {image_path}\n")
-                
-                # Check if image exists
-                if not os.path.exists(image_path):
-                    print(f"Warning: Image not found at {image_path}, skipping example {idx+1}/{len(questions)}, Line {line_number}")
-                    with open(log_file, 'a') as log_f:
-                        log_f.write(f"Error: Image not found, skipping\n")
-                    continue
-                
-                # Load and encode image for API
+        # Group examples into batches for parallel processing
+        batch_size = num_api_threads * 2  # Process 2 batches per thread
+        for batch_start in range(0, len(questions), batch_size):
+            batch_end = min(batch_start + batch_size, len(questions))
+            batch_indices = range(batch_start, batch_end)
+            
+            # Prepare API call arguments for the batch
+            api_args = []
+            for idx in batch_indices:
                 try:
-                    def encode_image(image_path):
-                        with open(image_path, "rb") as image_file:
-                            return base64.b64encode(image_file.read()).decode('utf-8')
+                    # Encode image
+                    base64_image = encode_image(image_paths[idx])
                     
-                    base64_image = encode_image(image_path)
+                    # Create prompt
+                    prompt = questions[idx] + " Output the thinking process in <think> </think> and final answer in <answer> </answer> tags."
+                    
+                    # Add to API args - now including api_key and base_url instead of client
+                    api_args.append((openai_api_key, openai_base_url, prompt, base64_image, default_kwargs, num_of_generations))
                 except Exception as e:
-                    print(f"Error encoding image {image_path}: {e}, skipping example {idx+1}/{len(questions)}, Line {line_number}")
-                    with open(log_file, 'a') as log_f:
-                        log_f.write(f"Error encoding image: {e}\n")
+                    print(f"Error preparing API call for example {idx}: {e}")
+                    continue
+            
+            # Make parallel API calls
+            api_responses = pool.map(call_api_for_completion, api_args)
+            
+            # Process responses in main thread
+            for idx, choices in zip(batch_indices, api_responses):
+                if not choices:
                     continue
                 
-                # Create prompt with instruction to use think/answer format
-                prompt = question + " Output the thinking process in <think> </think> and final answer in <answer> </answer> tags."
-                
-                # Try multiple generations
-                accepted = False
-
                 try:
+                    # Log progress
                     with open(log_file, 'a') as log_f:
-                        log_f.write(f"\nGenerating {num_of_generations} completions in a single API call\n")
+                        log_f.write(f"\n--- Processing example {idx+1}/{len(questions)}, Line {line_numbers[idx]} ---\n")
+                        log_f.write(f"Question: {questions[idx]}\n")
+                        log_f.write(f"Ground Truth: {ground_truths[idx]}\n")
+                        log_f.write(f"Image Path: {image_paths[idx]}\n")
                     
-                    # Use the 'n' parameter to generate multiple completions in one API call
-                    response = client.chat.completions.create(
-                        model=default_kwargs["model"],
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": prompt
-                                    },
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:image/jpeg;base64,{base64_image}"
-                                        }
-                                    }
-                                ]
-                            }
-                        ],
-                        max_tokens=default_kwargs.get("max_tokens", 1024),
-                        temperature=default_kwargs.get("temperature", 0.7),
-                        top_p=default_kwargs.get("top_p", 1.0),
-                        n=num_of_generations  # Generate multiple completions
-                    )
-                    
+                    accepted = False
                     # Process each generated completion
-                    for gen_idx, choice in enumerate(response.choices):
-                        # Extract the model's response
+                    for gen_idx, choice in enumerate(choices):
                         model_response = choice.message.content
                         
                         with open(log_file, 'a') as log_f:
@@ -566,14 +597,16 @@ def rejection_sampling_vqa(
                         
                         # Format for reward evaluation
                         completion = [[{"content": model_response}]]
-                        solution = [f"<answer> {ground_truth} </answer>"]
+                        solution = [f"<answer> {ground_truths[idx]} </answer>"]
                         
-                        # Evaluate with reward functions
+                        # Evaluate with reward functions in main thread
                         rewards = []
                         for reward_func in reward_funcs:
                             if reward_func == accuracy_reward:
-                                reward = reward_func(completion, solution, accu_reward_method=[accu_reward_methods[idx]], 
-                                                    image_path=[image_path], problem=[question])
+                                reward = reward_func(completion, solution, 
+                                                  accu_reward_method=[accu_reward_methods[idx]], 
+                                                  image_path=[image_paths[idx]], 
+                                                  problem=[questions[idx]])
                             else:
                                 reward = reward_func(completion)
                             rewards.append(reward[0])
@@ -583,19 +616,20 @@ def rejection_sampling_vqa(
                         
                         # Check if this generation passes all reward thresholds
                         if all(r > reward_threshold for r in rewards):
+                            prompt = questions[idx] + " Output the thinking process in <think> </think> and final answer in <answer> </answer> tags."
                             # Create data object
                             data_obj = {
-                                "image": original_image_paths[idx] if original_image_paths else image_path,
+                                "image": original_image_paths[idx] if original_image_paths else image_paths[idx],
                                 "conversations": [
                                     {"role": "user", "value": f"<image>\n{prompt}"},
                                     {"role": "assistant", "value": model_response}
                                 ],
-                                "question": question,
-                                "solution": ground_truth,
+                                "question": questions[idx],
+                                "solution": ground_truths[idx],
                                 "accu_reward_method": accu_reward_methods[idx],
                                 "rewards": rewards,
                                 "passed_rejection_sampling": True,
-                                "input_line_number": line_number,  # Store the line number for resuming
+                                "input_line_number": line_numbers[idx],  # Store the line number for resuming
                                 "generation_number": gen_idx + 1,  # Store which generation attempt succeeded
                                 "total_generations": num_of_generations,
                                 "timestamp": datetime.now().isoformat()
@@ -611,38 +645,24 @@ def rejection_sampling_vqa(
                                 log_f.write(f"ACCEPTED: Example passed rejection sampling (completion {gen_idx+1})\n")
                             
                             # Print without thread lock
-                            print(f"Processed {idx+1}/{len(questions)}, Line {line_number}, Accepted: {accepted_count}, Generation: {gen_idx+1}/{num_of_generations}, Rewards: {rewards}")
+                            print(f"Processed {idx+1}/{len(questions)}, Line {line_numbers[idx]}, Accepted: {accepted_count}, Generation: {gen_idx+1}/{num_of_generations}, Rewards: {rewards}")
                             break  # Stop processing further completions once we find an acceptable one
                         else:
                             with open(log_file, 'a') as log_f:
                                 log_f.write(f"REJECTED: Completion {gen_idx+1} - Rewards below threshold\n")
-                            print(f"Processed {idx+1}/{len(questions)}, Line {line_number}, Generation {gen_idx+1}/{num_of_generations} Rejected, Rewards: {rewards}")
-                    
-                    # If all generations failed, log the final result
-                    if not accepted:
-                        with open(log_file, 'a') as log_f:
-                            log_f.write(f"FINAL RESULT: All {num_of_generations} completions rejected\n")
-                        print(f"Processed {idx+1}/{len(questions)}, Line {line_number}, All {num_of_generations} completions rejected")
+                            print(f"Processed {idx+1}/{len(questions)}, Line {line_numbers[idx]}, Generation {gen_idx+1}/{num_of_generations} Rejected, Rewards: {rewards}")
                 
                 except Exception as e:
-                    with open(log_file, 'a') as log_f:
-                        log_f.write(f"Error in generation: {e}\n")
-                        import traceback
-                        log_f.write(traceback.format_exc() + "\n")
-                    print(f"Error in generation for example {idx} (Line {line_number}): {e}")
+                    print(f"Error processing response for example {idx}: {e}")
                     continue
-                
-            except Exception as e:
-                with open(log_file, 'a') as log_f:
-                    log_f.write(f"Error processing example: {e}\n")
-                    import traceback
-                    log_f.write(traceback.format_exc() + "\n")
-                print(f"Error processing example {idx} (Line {line_number}): {e}")
-                continue
+    
+    # Clean up
+    pool.close()
+    pool.join()
     
     return accepted_count
 
-def process_file(data_file, image_folder, accu_reward_method, output_dir, args, reward_funcs):
+def process_file(data_file, image_folder, accu_reward_method, output_dir, args, reward_funcs, num_api_threads=4):
     """Process a single data file with its corresponding image folder"""
     print(f"Processing {data_file} with {image_folder}")
     
@@ -754,6 +774,7 @@ def process_file(data_file, image_folder, accu_reward_method, output_dir, args, 
         original_image_paths=original_image_paths,
         line_numbers=line_numbers,
         num_of_generations=args.num_of_generations,
+        num_api_threads=num_api_threads
     )
     
     print(f"File {data_file} completed. Accepted {accepted_count} out of {len(questions)} examples.")
@@ -808,7 +829,8 @@ def main(script_args):
                 accu_reward_method, 
                 output_dir, 
                 script_args, 
-                reward_funcs
+                reward_funcs,
+                num_api_threads=script_args.num_api_threads
             )
             total_accepted += accepted_count
             
@@ -851,6 +873,8 @@ if __name__ == "__main__":
     parser.add_argument("--skip_lines", type=int, default=0, help="Minimum line number to start processing from. The script will automatically determine the starting point based on already processed examples, but will not go below this value.")
     parser.add_argument("--num_of_generations", type=int, default=1, help="Number of generations to try for each example before rejecting")
     parser.add_argument("--use_resume_file", action="store_true", help="Use resume file to track progress across runs")
+    parser.add_argument("--num_api_threads", type=int, default=4, 
+                       help="Number of processes to use for parallel API calls")
     
     args = parser.parse_args()
     main(args)

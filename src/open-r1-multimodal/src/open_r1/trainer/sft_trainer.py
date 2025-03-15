@@ -28,6 +28,7 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 from transformers.utils import is_peft_available
+from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -134,16 +135,22 @@ class VLMSFTTrainer(Trainer):
 
         # Data collator for SFT
         def data_collator(examples):
-            batch = {"input_ids": [], "attention_mask": [], "labels": []}
+            device = self.accelerator.device if hasattr(self, "accelerator") else "cpu"
             
-            for example in examples:
-                print(example)
-                # Load image if path is provided
-                if 'image_path' in example and example['image_path'] is not None:
-                    image = PIL.Image.open(example['image_path'])
-                    
+            prompts = [x["prompt"] for x in examples]
+            prompts_text = [maybe_apply_chat_template(example, processing_class)["prompt"] for example in examples]
+            
+            # Handle both pre-loaded images and image paths
+            images = []
+            for x in examples:
+                if "image" in x:
+                    img = x["image"]
+                elif "image_path" in x and x["image_path"] is not None:
+                    img = PIL.Image.open(x["image_path"])
+                
+                try:
                     # Ensure minimum dimensions of 28 pixels
-                    w, h = image.size
+                    w, h = img.size
                     if w < 28 or h < 28:
                         # Calculate new dimensions maintaining aspect ratio
                         if w < h:
@@ -152,50 +159,35 @@ class VLMSFTTrainer(Trainer):
                         else:
                             new_h = 28
                             new_w = int(w * (28/h))
-                            image = image.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
-                    
-                    # Format conversation with image
-                    conversation = [
-                        {"role": "user", "content": [
-                            {"type": "image", "image": image},
-                            {"type": "text", "text": example['problem']}
-                        ]},
-                        {"role": "assistant", "content": example['solution']}
-                    ]
-                    
-                    # Process with image
-                    inputs = processing_class(
-                        conversation,
-                return_tensors="pt",
-                        padding="max_length",
-                        max_length=2048,
-                        truncation=True
-                    )
-                else:
-                    # Format conversation without image
-                    conversation = [
-                        {"role": "user", "content": example['problem']},
-                        {"role": "assistant", "content": example['solution']}
-                    ]
-                    
-                    # Process without image
-                    inputs = processing_class(
-                        conversation,
-                        return_tensors="pt",
-                        padding="max_length",
-                        max_length=2048,
-                        truncation=True
-                    )
+                        img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
                 
-                # Add to batch
-                for key in ["input_ids", "attention_mask", "labels"]:
-                    if key in inputs:
-                        batch[key].append(inputs[key][0])
+                    images.append(img)
+                except:
+                    pass
             
-            # Stack tensors
-            for key in batch:
-                if batch[key] and torch.is_tensor(batch[key][0]):
-                    batch[key] = torch.stack(batch[key])
+            # Process inputs based on whether images are present
+            if len(images) > 0:
+                batch = processing_class(
+                    text=prompts_text,
+                    images=images,
+                    return_tensors="pt",
+                    padding=True,
+                    padding_side="left",
+                    add_special_tokens=False,
+                )
+            else:
+                batch = processing_class(
+                    text=prompts_text,
+                    return_tensors="pt",
+                    padding=True,
+                    padding_side="left",
+                    add_special_tokens=False,
+                )
+            
+            # Add labels for training
+            # print(batch["input_ids"].shape)
+            # print(batch["input_ids"])
+            batch["labels"] = batch["input_ids"].clone()
             
             return batch
 
