@@ -46,18 +46,26 @@ from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_f
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
-from accelerate.utils import is_peft_model, set_seed
+from accelerate.utils import is_peft_model, set_seed, broadcast_object_list, gather, gather_object
 import PIL.Image
 
 import copy
 from torch.utils.data import Sampler
 import warnings
 
+from trl.import_utils import is_vllm_available
+from accelerate.utils.other import is_compiled_module
+from unittest.mock import patch
+
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
 if is_wandb_available():
     import wandb
+
+if is_vllm_available():
+    from vllm import LLM, SamplingParams
+    from vllm.sampling_params import GuidedDecodingParams
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -216,6 +224,8 @@ class Qwen2VLGRPOTrainer(Trainer):
         attn_implementation: str = "flash_attention_2",
         torch_dtype: str = "bfloat16",
     ):
+        self.max_pixels = max_pixels
+        self.min_pixels = min_pixels
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
@@ -444,6 +454,97 @@ class Qwen2VLGRPOTrainer(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
+        # Add after other training arguments setup
+        self.use_vllm = args.use_vllm
+
+        # Add vLLM setup
+        if self.use_vllm:
+            if not is_vllm_available():
+                raise ImportError(
+                    "vLLM is not available and `use_vllm` is set to True. Please install vLLM with "
+                    "`pip install vllm` to use it."
+                )
+
+            if self.accelerator.is_main_process:
+                vllm_device = self.args.vllm_device
+                device_type = self.accelerator.device.type
+                device_module = getattr(torch, device_type)
+                if vllm_device == "auto":
+                    if device_module.device_count() == 1:
+                        vllm_device = f"{device_type}:0"  # particular case when training with only 1 device: share it
+                    else:
+                        vllm_device = f"{device_type}:{self.accelerator.num_processes}"  # take the next GPU idx
+                # Check that the requested device is available
+                if (
+                    vllm_device.split(":")[0] == f"{device_type}"
+                    and int(vllm_device.split(":")[1]) >= device_module.device_count()
+                ):
+                    raise ValueError(
+                        f"The requested device for vllm ({vllm_device}) is not available. You are likely using vLLM "
+                        "without restricting the number of GPUs for training. Set the `--num_processes` argument to a "
+                        "value lower than the number of GPUs available on your machine—typically, reducing it by one "
+                        f"is sufficient. In your case: `--num_processes {device_module.device_count() - 1}`."
+                    )
+                # Check that the requested device is not also used for training
+                if vllm_device in {f"{device_type}:{idx}" for idx in range(self.accelerator.num_processes)}:
+                    warnings.warn(
+                        f"The requested device {vllm_device} is also being used for training. For higher throughput "
+                        "and to avoid out-of-memory errors, it is recommended to use a dedicated device for vLLM. "
+                        "If this is intentional, you may ignore this warning but should adjust "
+                        "`vllm_gpu_memory_utilization` accordingly."
+                    )
+                # vLLM is not compatible with accelerate. So we need to patch it to make sure we can (1) place the vLLM
+                # model on the desired device (world_size_patch) and (2) avoid a test that is not designed for our
+                # setting (profiling_patch).
+                world_size_patch = patch(
+                    "torch.distributed.get_world_size", return_value=1
+                )
+                profiling_patch = patch(
+                    "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+                    return_value=None,
+                )
+                with world_size_patch, profiling_patch:
+                    # Create vLLM instance
+                    self.llm = LLM(
+                        model=model_id,
+                        device=vllm_device,
+                        gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                        dtype=self.args.vllm_dtype,
+                        # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
+                        # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
+                        # This is particularly useful here because we generate completions from the same prompts.
+                        enable_prefix_caching=self.args.vllm_enable_prefix_caching,
+                        enforce_eager=True,
+                        enable_chunked_prefill=False,
+                        max_model_len=self.args.max_prompt_length + self.args.max_completion_length,
+                        mm_processor_kwargs={
+                            "max_pixels": max_pixels,
+                            "min_pixels": min_pixels
+                        },
+                    )
+                    print("vLLM initialized")
+
+                # Guided decoding, if enabled
+                if args.vllm_guided_decoding_regex is not None:
+                    guided_decoding = GuidedDecodingParams(backend="outlines", regex=args.vllm_guided_decoding_regex)
+                else:
+                    guided_decoding = None
+
+                # Sampling parameters
+                self.sampling_params = SamplingParams(
+                    temperature=args.temperature,
+                    max_tokens=self.max_completion_length,
+                    guided_decoding=guided_decoding,
+                    n=args.num_generations,
+                )
+
+            self._last_loaded_step = 0  # tag to avoid useless loading during grad accumulation
+
+            # When using vLLM, the main process is responsible for loading the model weights. This can cause process
+            # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
+            # synchronize all processes after vLLM has been fully initialized.
+            self.accelerator.wait_for_everyone()
+
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
         # Ensure use_cache is disabled
@@ -556,17 +657,86 @@ class Qwen2VLGRPOTrainer(Trainer):
         #     prompt_mask = prompt_mask[:, -self.max_prompt_length :]
         #     prompt_inputs["attention_mask"] = prompt_mask
 
-        # Generate completions
-        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-            prompt_completion_ids = unwrapped_model.generate(
-                **prompt_inputs, 
-                generation_config=self.generation_config
-            )
+        # Generate completions using either vLLM or regular generation
+        if self.use_vllm:
+            # First, have main process load weights if needed
+            if self.state.global_step != self._last_loaded_step:
+                self._move_model_to_vllm()
+                self._last_loaded_step = self.state.global_step
 
-            prompt_length = prompt_ids.size(1)
-            prompt_ids = prompt_completion_ids[:, :prompt_length]
-            completion_ids = prompt_completion_ids[:, prompt_length:]
-            # No need to repeat prompt_mask as we're not duplicating prompts during generation
+            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            all_prompts_text = gather_object(prompts_text)
+            all_images = gather_object(images)
+
+            if self.accelerator.is_main_process:
+                # Prepare multimodal inputs for vLLM
+                all_multimodal_inputs = [
+                    {"prompt": prompt, "multi_modal_data": {"image": image},
+                    "mm_processor_kwargs": { "max_pixels": self.max_pixels, "min_pixels": self.min_pixels} } 
+                    for prompt, image in zip(all_prompts_text, all_images)
+                ]
+                
+                # Debug information to understand the data structure
+                print(f"On device {self.accelerator.device}, Total inputs gathered: {len(all_multimodal_inputs)}")
+                
+                # Create a dictionary to track unique prompt-image pairs
+                seen = {}
+                ordered_unique_inputs = []
+                
+                # Process inputs in chunks of num_generations (since each original input is repeated num_generations times)
+                for i in range(0, len(all_multimodal_inputs), self.num_generations):
+                    # Take only the first item from each chunk (they're all duplicates)
+                    input_dict = all_multimodal_inputs[i]
+                    key = (input_dict["prompt"], id(input_dict["multi_modal_data"]["image"]))
+                    if key not in seen:
+                        seen[key] = True
+                        ordered_unique_inputs.append(input_dict)
+
+                all_outputs = self.llm.generate(
+                    ordered_unique_inputs, sampling_params=self.sampling_params, use_tqdm=True,
+                )
+
+                completion_ids = []
+                for outputs in all_outputs:
+                    for output in outputs.outputs:
+                        completion_ids.append(output.token_ids)
+            else:
+                completion_ids = [None] * len(all_prompts_text)
+
+            # Broadcast the completions from the main process to all processes
+            completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            
+            process_slice = slice(
+                self.accelerator.process_index * len(prompts),
+                (self.accelerator.process_index + 1) * len(prompts),
+            )
+            completion_ids = completion_ids[process_slice]
+
+            # Pad the completions, and concatenate them with the prompts
+            completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
+            max_len = max(len(ids) for ids in completion_ids)
+            padded_completion_ids = []
+            for ids in completion_ids:
+                if len(ids) < max_len:
+                    padding = torch.full((max_len - len(ids),), self.processing_class.pad_token_id, 
+                                         device=device, dtype=ids.dtype)
+                    padded_completion_ids.append(torch.cat([ids, padding]))
+                else:
+                    padded_completion_ids.append(ids)
+            completion_ids = torch.stack(padded_completion_ids)
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+
+        else:
+            # Generate completions using transformers
+            with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                prompt_completion_ids = unwrapped_model.generate(
+                    **prompt_inputs,
+                    generation_config=self.generation_config
+                )
+
+        prompt_length = prompt_ids.size(1)
+        prompt_ids = prompt_completion_ids[:, :prompt_length]
+        completion_ids = prompt_completion_ids[:, prompt_length:]
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -845,4 +1015,37 @@ class Qwen2VLGRPOTrainer(Trainer):
             mini_repeat_count=self.num_generations,
             seed=self.args.seed,
         )
+
+    def _move_model_to_vllm(self):
+        with unwrap_model_for_generation(
+            self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+        ) as unwrapped_model:
+            if is_compiled_module(unwrapped_model):
+                unwrapped_model = unwrapped_model._orig_mod
+            if is_peft_model(unwrapped_model):
+                unwrapped_model.merge_adapter()
+                state_dict = unwrapped_model.state_dict()
+                # Remove base_model and base_layer prefixes
+                state_dict = {
+                    k.removeprefix("base_model.model.").replace(".base_layer", ""): v for k, v in state_dict.items()
+                }
+                # Remove values with adapter prefix (example: "_lora")
+                state_dict = {k: v for k, v in state_dict.items() if unwrapped_model.prefix not in k}
+                # When module to save, remove its prefix and discard the original module
+                state_dict = {
+                    k.replace("modules_to_save.default.", ""): v
+                    for k, v in state_dict.items()
+                    if "original_module" not in k
+                }
+            else:
+                state_dict = unwrapped_model.state_dict()
+            
+            if self.accelerator.is_main_process:
+                llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                llm_model.load_weights(state_dict.items())
+                
+            # Unmerge the adapter to restore the model to its original state.
+            # This must be done after loading weights to ensure they correspond to the merged state.
+            if is_peft_model(unwrapped_model):
+                unwrapped_model.unmerge_adapter()
 
