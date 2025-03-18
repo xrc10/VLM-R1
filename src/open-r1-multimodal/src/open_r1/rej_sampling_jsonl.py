@@ -289,7 +289,7 @@ def clean_text(text, exclue_chars=['\n', '\r']):
 
 def default_accuracy_reward(content, sol, **kwargs):
     reward = 0.0
-    # Extract answer from solution if it has think/answer tags
+        # Extract answer from solution if it has think/answer tags
     sol_match = re.search(r'<answer>(.*?)</answer>', sol)
     ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
     
@@ -299,11 +299,9 @@ def default_accuracy_reward(content, sol, **kwargs):
     
     # Try symbolic verification first for numeric answers
     try:
-        # Only attempt symbolic verification in the main thread
-        if threading.current_thread() is threading.main_thread():
-            answer = parse(student_answer)
-            if float(verify(answer, parse(ground_truth))) > 0:
-                reward = 1.0
+        answer = parse(student_answer)
+        if float(verify(answer, parse(ground_truth))) > 0:
+            reward = 1.0
     except Exception:
         pass  # Continue to next verification method if this fails
 
@@ -315,9 +313,11 @@ def default_accuracy_reward(content, sol, **kwargs):
             # Check if it's a multiple choice question
             has_choices = extract_choice(ground_truth)
             
+            has_yes_no = bool(re.search(r'\b(yes|no)\b', ground_truth.lower()))
+            
             if has_numbers:
                 # For numeric answers, use exact matching
-                reward = numeric_reward(student_answer, ground_truth)
+                reward = math_reward(student_answer, ground_truth)
                 if reward is None:
                     reward = ratio(clean_text(student_answer), clean_text(ground_truth))
             elif has_choices:
@@ -326,6 +326,10 @@ def default_accuracy_reward(content, sol, **kwargs):
                 student_choice = extract_choice(student_answer)
                 if student_choice:
                     reward = 1.0 if student_choice == correct_choice else 0.0
+            elif has_yes_no:
+                reward = yes_no_reward(student_answer, ground_truth)
+                if reward is None:
+                    reward = ratio(clean_text(student_answer), clean_text(ground_truth))
             else:
                 # For text answers, use fuzzy matching
                 reward = ratio(clean_text(student_answer), clean_text(ground_truth))
