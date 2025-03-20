@@ -693,7 +693,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                         ordered_unique_inputs.append(input_dict)
 
                 all_outputs = self.llm.generate(
-                    ordered_unique_inputs, sampling_params=self.sampling_params, use_tqdm=True,
+                    ordered_unique_inputs, sampling_params=self.sampling_params, use_tqdm=False,
                 )
 
                 completion_ids = []
@@ -776,7 +776,9 @@ class Qwen2VLGRPOTrainer(Trainer):
                     ref_per_token_logps = self._get_per_token_logps(
                         model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw
                     )
-        ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1:]
+        
+        if not self.beta == 0.0:
+            ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1:]
 
         # Decode the generated completions
         completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
